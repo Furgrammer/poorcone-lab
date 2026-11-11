@@ -15,12 +15,12 @@ from hybrid_search import rank_notes_hybrid
 initialize_database()
 
 st.set_page_config(
-    page_title="PAIR Lab",
+    page_title="Poorcone Lab",
     page_icon="🧪",
     layout="centered",
 )
 
-st.title("PAIR Lab")
+st.title("Poorcone Lab")
 st.caption("Personal AI Research Lab — Knowledge Vault")
 
 # Bagian 1: Formulir menambah catatan
