@@ -2,6 +2,7 @@ import streamlit as st
 
 from database import (
     add_note,
+    update_note,
     delete_note,
     get_all_notes,
     initialize_database,
@@ -12,164 +13,627 @@ from semantic_search import rank_notes_semantic
 from hybrid_search import rank_notes_hybrid
 
 
-initialize_database()
+# ============================================================
+# 1. APPLICATION CONFIGURATION
+# ============================================================
 
 st.set_page_config(
     page_title="Poorcone Lab",
     page_icon="🧪",
-    layout="centered",
+    layout="wide",
+    initial_sidebar_state="collapsed",
 )
 
-st.title("Poorcone Lab")
-st.caption("Personal AI Research Lab — Knowledge Vault")
-
-# Bagian 1: Formulir menambah catatan
-with st.form("note_form"):
-    title = st.text_input("Judul catatan")
-
-    category = st.selectbox(
-        "Kategori",
-        [
-            "Python",
-            "Machine Learning",
-            "AI",
-            "Project",
-            "Lainnya",
-        ],
-    )
-
-    content = st.text_area("Isi catatan")
-
-    submitted = st.form_submit_button("Simpan catatan")
-
-    if submitted:
-        if title.strip() and content.strip():
-            add_note(title.strip(), category, content.strip())
-            st.success("Catatan berhasil disimpan.")
-        else:
-            st.warning("Judul dan isi catatan harus diisi.")
+initialize_database()
 
 
-st.divider()
-st.subheader("Cari pengetahuan")
+# ============================================================
+# 2. CUSTOM STYLING
+# ============================================================
 
-search_method = st.selectbox(
-    "Metode pencarian",
-    [
-        "Adaptive Hybrid Search",
-        "Character TF-IDF",
-        "Word TF-IDF",
-        "Semantic Search",
-    ],
-    index=0,
+st.markdown(
+    """
+    <style>
+        .block-container {
+            max-width: 1180px;
+            padding-top: 2.5rem;
+            padding-bottom: 3rem;
+        }
+
+        [data-testid="stMetric"] {
+            background: rgba(128, 128, 128, 0.07);
+            border: 1px solid rgba(128, 128, 128, 0.18);
+            border-radius: 12px;
+            padding: 16px;
+        }
+
+        div[data-testid="stForm"] {
+            border: 1px solid rgba(128, 128, 128, 0.22);
+            border-radius: 12px;
+            padding: 20px;
+        }
+
+        .stTabs [data-baseweb="tab-list"] {
+            gap: 12px;
+        }
+
+        [data-testid="stExpander"] {
+            border-radius: 10px;
+        }
+    </style>
+    """,
+    unsafe_allow_html=True,
 )
 
-st.caption(
-    "Adaptive Hybrid: menggunakan Character TF-IDF "
-    "untuk partial query dan Hybrid RRF untuk query normal."
-)
 
-keyword = st.text_input("Masukkan kata kunci")
-all_notes = get_all_notes()
+# ============================================================
+# 3. HELPER FUNCTIONS
+# ============================================================
 
-
-compare_methods = st.checkbox("Bandingkan Word TF-IDF dan Character TF-IDF")
-
-if keyword.strip() and compare_methods:
-    word_results = rank_notes(all_notes, keyword, limit=3)
-    char_results = rank_notes_char(all_notes, keyword, limit=3)
-
-    st.markdown("#### Perbandingan hasil pencarian")
-
-    comparison_rows = []
-    row_count = max(len(word_results), len(char_results), 1)
-
-    for index in range(row_count):
-        word_label = "—"
-        char_label = "—"
-
-        if index < len(word_results):
-            note, score = word_results[index]
-            word_label = f"{note[1]} ({score:.3f})"
-        elif index == 0:
-            word_label = "Tidak ada hasil"
-
-        if index < len(char_results):
-            note, score = char_results[index]
-            char_label = f"{note[1]} ({score:.3f})"
-        elif index == 0:
-            char_label = "Tidak ada hasil"
-
-        comparison_rows.append(
-            {
-                "Peringkat": index + 1,
-                "Word TF-IDF": word_label,
-                "Character TF-IDF": char_label,
-            }
-        )
-
-    st.table(comparison_rows)
-
-    st.caption(
-        "Maksimal 3 hasil per metode. Skor menunjukkan kemiripan "
-        "dalam masing-masing metode; skor kedua metode tidak "
-        "dapat dibandingkan secara langsung."
-    )
+NOTE_CATEGORIES = [
+    "Python",
+    "Machine Learning",
+    "AI",
+    "Game Development",
+    "Software Engineering",
+    "Data Science",
+    "Project",
+    "Lainnya",
+]
 
 
-if keyword.strip():
-    if search_method == "Adaptive Hybrid Search":
-        results = rank_notes_hybrid(
-            all_notes,
-            keyword,
-            limit=10,
-        )
+def render_note_list(notes):
+    """Menampilkan catatan dengan opsi edit dan hapus."""
 
-    elif search_method == "Character TF-IDF":
-        results = rank_notes_char(
-            all_notes,
-            keyword,
-            limit=10,
-        )
-
-    elif search_method == "Word TF-IDF":
-        results = rank_notes(
-            all_notes,
-            keyword,
-            limit=10,
-        )
-
-    elif search_method == "Semantic Search":
-        results = rank_notes_semantic(
-            all_notes,
-            keyword,
-            limit=10,
-            min_score=0.20,
-        )
-
-else:
-    results = [(note, None) for note in all_notes]
-
-if keyword.strip() and not results:
-    st.info("Tidak ditemukan catatan yang cocok.")
-elif not results:
-    st.info("Belum ada catatan yang tersimpan.")
-else:
-    if keyword.strip():
-        if search_method == "Character TF-IDF":
-            st.caption("Character TF-IDF — ambang skor minimum 0.12.")
-        else:
-            st.caption("Word TF-IDF — pencarian berdasarkan fitur kata.")
-
-    for note, score in results:
+    for index, note in enumerate(notes, start=1):
         note_id, title, category, content = note
 
-        with st.expander(f"{title} — {category}"):
+        is_editing = st.session_state.get("editing_note_id") == note_id
+
+        with st.expander(
+            f"{index}. {title} — {category}",
+            expanded=is_editing,
+        ):
+            # ------------------------------------------------
+            # EDIT MODE
+            # ------------------------------------------------
+
+            if is_editing:
+                st.markdown("#### Edit Catatan")
+
+                # Pertahankan kategori lama jika belum tersedia
+                # dalam pilihan kategori terbaru.
+                edit_categories = NOTE_CATEGORIES.copy()
+
+                if category not in edit_categories:
+                    edit_categories.insert(0, category)
+
+                with st.form(f"edit_note_form_{note_id}"):
+                    edited_title = st.text_input(
+                        "Judul catatan",
+                        value=title,
+                    )
+
+                    edited_category = st.selectbox(
+                        "Kategori",
+                        edit_categories,
+                        index=edit_categories.index(category),
+                    )
+
+                    edited_content = st.text_area(
+                        "Isi catatan",
+                        value=content,
+                        height=220,
+                    )
+
+                    save_col, cancel_col = st.columns(2)
+
+                    with save_col:
+                        save_submitted = st.form_submit_button(
+                            "💾 Simpan perubahan",
+                            type="primary",
+                            use_container_width=True,
+                        )
+
+                    with cancel_col:
+                        cancel_submitted = st.form_submit_button(
+                            "Batal",
+                            use_container_width=True,
+                        )
+
+                # Proses penyimpanan
+                if save_submitted:
+                    if edited_title.strip() and edited_content.strip():
+                        updated = update_note(
+                            note_id,
+                            edited_title.strip(),
+                            edited_category,
+                            edited_content.strip(),
+                        )
+
+                        if updated:
+                            st.session_state.pop(
+                                "editing_note_id",
+                                None,
+                            )
+
+                            st.session_state.pop(
+                                "last_search",
+                                None,
+                            )
+
+                            st.session_state["flash_message"] = (
+                                f"Catatan '{edited_title.strip()}' berhasil diperbarui."
+                            )
+
+                            st.rerun()
+
+                        else:
+                            st.error(
+                                "Catatan tidak ditemukan atau "
+                                "tidak mengalami perubahan."
+                            )
+
+                    else:
+                        st.warning("Judul dan isi catatan harus diisi.")
+
+                # Batalkan proses edit
+                if cancel_submitted:
+                    st.session_state.pop(
+                        "editing_note_id",
+                        None,
+                    )
+
+                    st.rerun()
+
+            # ------------------------------------------------
+            # VIEW MODE
+            # ------------------------------------------------
+
+            else:
+                st.write(content)
+
+                edit_col, delete_col = st.columns(2)
+
+                with edit_col:
+                    if st.button(
+                        "✏️ Edit Catatan",
+                        key=f"edit_{note_id}",
+                        use_container_width=True,
+                    ):
+                        st.session_state["editing_note_id"] = note_id
+
+                        st.rerun()
+
+                with delete_col:
+                    if st.button(
+                        "🗑️ Hapus Catatan",
+                        key=f"delete_{note_id}",
+                        use_container_width=True,
+                    ):
+                        delete_note(note_id)
+
+                        st.session_state.pop(
+                            "last_search",
+                            None,
+                        )
+
+                        st.session_state["flash_message"] = (
+                            f"Catatan '{title}' berhasil dihapus."
+                        )
+
+                        st.rerun()
+
+
+def render_search_results(results, method):
+    """Menampilkan hasil pencarian."""
+
+    if not results:
+        st.info("Tidak ditemukan catatan yang cocok.")
+        return
+
+    st.caption(f"Ditemukan {len(results)} hasil pencarian.")
+
+    score_labels = {
+        "Adaptive Hybrid Search": "Skor WRRF",
+        "Semantic Search": "Skor semantic",
+        "Character TF-IDF": "Skor Character TF-IDF",
+        "Word TF-IDF": "Skor Word TF-IDF",
+    }
+
+    for index, (note, score) in enumerate(results, start=1):
+        note_id, title, category, content = note
+
+        with st.expander(
+            f"#{index} · {title} — {category}",
+            expanded=(index == 1),
+        ):
             if score is not None:
-                st.caption(f"Skor kemiripan: {score:.3f}")
+                st.caption(f"{score_labels[method]}: {score:.4f}")
 
             st.write(content)
 
-            if st.button("Hapus catatan", key=f"delete_{note_id}"):
-                delete_note(note_id)
+
+# ============================================================
+# 4. LOAD DATA
+# ============================================================
+
+all_notes = get_all_notes()
+
+total_notes = len(all_notes)
+
+total_categories = len({note[2] for note in all_notes})
+
+
+# ============================================================
+# 5. HEADER
+# ============================================================
+
+flash_message = st.session_state.pop(
+    "flash_message",
+    None,
+)
+
+if flash_message:
+    st.success(flash_message)
+
+
+header_left, header_right = st.columns([4, 1])
+
+with header_left:
+    st.title("🧪 Poorcone Lab")
+    st.caption("Personal AI Research Lab — Knowledge Vault")
+
+with header_right:
+    st.caption("LOCAL KNOWLEDGE SYSTEM")
+
+
+st.divider()
+
+
+# ============================================================
+# 6. DASHBOARD METRICS
+# ============================================================
+
+metric1, metric2, metric3 = st.columns(3)
+
+with metric1:
+    st.metric(
+        "Total Notes",
+        total_notes,
+        help="Jumlah seluruh catatan dalam database.",
+    )
+
+with metric2:
+    st.metric(
+        "Categories",
+        total_categories,
+        help="Jumlah kategori berbeda yang digunakan.",
+    )
+
+with metric3:
+    st.metric(
+        "Search Modes",
+        4,
+        help="Adaptive Hybrid, Semantic, Character, dan Word TF-IDF.",
+    )
+
+
+st.divider()
+
+
+# ============================================================
+# 7. MAIN NAVIGATION
+# ============================================================
+
+explore_tab, add_tab, notes_tab = st.tabs(
+    [
+        "🔎 Explore",
+        "✍️ Add Notes",
+        "📚 My Notes",
+    ],
+    key="main_tabs",
+    on_change="rerun",
+)
+
+
+# ============================================================
+# 8. EXPLORE TAB
+# ============================================================
+
+with explore_tab:
+    st.subheader("Explore Your Knowledge")
+
+    st.caption("Temukan pengetahuan menggunakan keyword, semantic, atau hybrid search.")
+
+    # --------------------------------------------------------
+    # SEARCH FORM
+    # --------------------------------------------------------
+
+    with st.form("search_form"):
+        search_method = st.selectbox(
+            "Metode pencarian",
+            [
+                "Adaptive Hybrid Search",
+                "Semantic Search",
+                "Character TF-IDF",
+                "Word TF-IDF",
+            ],
+        )
+
+        keyword = st.text_input(
+            "Masukkan kata kunci atau pertanyaan",
+            placeholder=("Contoh: cara kerja supervised learning..."),
+        )
+
+        compare_methods = st.checkbox("Bandingkan Word TF-IDF dan Character TF-IDF")
+
+        search_submitted = st.form_submit_button(
+            "🔍 Cari pengetahuan",
+            type="primary",
+            use_container_width=True,
+        )
+
+    # --------------------------------------------------------
+    # SEARCH EXECUTION
+    # --------------------------------------------------------
+
+    method_descriptions = {
+        "Adaptive Hybrid Search": (
+            "Menggunakan Character TF-IDF untuk partial query "
+            "dan Hybrid Search berbasis WRRF untuk query normal."
+        ),
+        "Semantic Search": (
+            "Menggunakan sentence embeddings untuk mencari "
+            "catatan berdasarkan kemiripan makna."
+        ),
+        "Character TF-IDF": (
+            "Menggunakan fitur karakter untuk mendukung "
+            "pencarian kata dan potongan kata."
+        ),
+        "Word TF-IDF": (
+            "Menggunakan pembobotan kata untuk pencarian berbasis keyword."
+        ),
+    }
+
+    st.caption(method_descriptions[search_method])
+
+    if search_submitted:
+        if not keyword.strip():
+            st.warning("Masukkan kata kunci terlebih dahulu.")
+
+        elif not all_notes:
+            st.info("Belum ada catatan untuk dicari.")
+
+        else:
+            if search_method == "Adaptive Hybrid Search":
+                results = rank_notes_hybrid(
+                    all_notes,
+                    keyword,
+                    limit=10,
+                )
+
+            elif search_method == "Semantic Search":
+                results = rank_notes_semantic(
+                    all_notes,
+                    keyword,
+                    limit=10,
+                    min_score=0.20,
+                )
+
+            elif search_method == "Character TF-IDF":
+                results = rank_notes_char(
+                    all_notes,
+                    keyword,
+                    limit=10,
+                )
+
+            else:
+                results = rank_notes(
+                    all_notes,
+                    keyword,
+                    limit=10,
+                )
+
+            comparison = None
+
+            if compare_methods:
+                word_results = rank_notes(
+                    all_notes,
+                    keyword,
+                    limit=3,
+                )
+
+                char_results = rank_notes_char(
+                    all_notes,
+                    keyword,
+                    limit=3,
+                )
+
+                comparison = {
+                    "word": word_results,
+                    "char": char_results,
+                }
+
+            st.session_state["last_search"] = {
+                "query": keyword.strip(),
+                "method": search_method,
+                "results": results,
+                "comparison": comparison,
+            }
+
+    # --------------------------------------------------------
+    # DISPLAY SEARCH RESULTS
+    # --------------------------------------------------------
+
+    search_state = st.session_state.get("last_search")
+
+    if search_state:
+        st.divider()
+
+        st.markdown(f"#### Hasil pencarian: `{search_state['query']}`")
+
+        if search_state["comparison"] is not None:
+            st.markdown("##### Perbandingan metode")
+
+            word_results = search_state["comparison"]["word"]
+            char_results = search_state["comparison"]["char"]
+
+            comparison_rows = []
+
+            row_count = max(
+                len(word_results),
+                len(char_results),
+                1,
+            )
+
+            for index in range(row_count):
+                word_label = "Tidak ada hasil"
+                char_label = "Tidak ada hasil"
+
+                if index < len(word_results):
+                    note, score = word_results[index]
+
+                    word_label = f"{note[1]} ({score:.3f})"
+
+                if index < len(char_results):
+                    note, score = char_results[index]
+
+                    char_label = f"{note[1]} ({score:.3f})"
+
+                comparison_rows.append(
+                    {
+                        "Rank": index + 1,
+                        "Word TF-IDF": word_label,
+                        "Character TF-IDF": char_label,
+                    }
+                )
+
+            st.table(comparison_rows)
+
+            st.caption(
+                "Skor Word dan Character TF-IDF berasal dari "
+                "metode berbeda, sehingga tidak dapat dibandingkan "
+                "secara langsung."
+            )
+
+        st.markdown("##### Search Results")
+
+        render_search_results(
+            search_state["results"],
+            search_state["method"],
+        )
+
+    else:
+        st.info(
+            "Masukkan kata kunci dan pilih metode pencarian "
+            "untuk mulai menjelajahi knowledge base."
+        )
+
+        st.markdown(
+            """
+            **Contoh pencarian:**
+
+            - `supervised learning`
+            - `belajar dari data berlabel`
+            - `supervis`
+            - `pygame collision detection`
+            """
+        )
+
+
+# ============================================================
+# 9. ADD NOTES TAB
+# ============================================================
+
+with add_tab:
+    st.subheader("Create New Note")
+
+    st.caption(
+        "Simpan pengetahuan, ide, atau dokumentasi ke dalam personal knowledge base."
+    )
+
+    with st.form("note_form", clear_on_submit=True):
+        title = st.text_input(
+            "Judul catatan",
+            placeholder="Contoh: Introduction to Machine Learning",
+        )
+
+        category = st.selectbox(
+            "Kategori",
+            NOTE_CATEGORIES,
+        )
+
+        content = st.text_area(
+            "Isi catatan",
+            placeholder="Tuliskan pengetahuan atau informasi...",
+            height=220,
+        )
+
+        submitted = st.form_submit_button(
+            "💾 Simpan catatan",
+            type="primary",
+            use_container_width=True,
+        )
+
+        if submitted:
+            if title.strip() and content.strip():
+                add_note(
+                    title.strip(),
+                    category,
+                    content.strip(),
+                )
+
+                st.session_state.pop("last_search", None)
+
+                st.session_state["flash_message"] = "Catatan berhasil disimpan."
+
                 st.rerun()
+
+            else:
+                st.warning("Judul dan isi catatan harus diisi.")
+
+
+# ============================================================
+# 10. MY NOTES TAB
+# ============================================================
+
+with notes_tab:
+    st.subheader("My Knowledge Vault")
+
+    st.caption("Kelola dan lihat seluruh catatan yang tersimpan.")
+
+    if not all_notes:
+        st.info("Belum ada catatan. Mulai dengan menambahkan catatan pertama.")
+
+    else:
+        available_categories = sorted({note[2] for note in all_notes})
+
+        selected_category = st.selectbox(
+            "Filter kategori",
+            ["Semua kategori"] + available_categories,
+        )
+
+        if selected_category == "Semua kategori":
+            filtered_notes = all_notes
+
+        else:
+            filtered_notes = [
+                note for note in all_notes if note[2] == selected_category
+            ]
+
+        st.caption(f"Menampilkan {len(filtered_notes)} dari {total_notes} catatan.")
+
+        render_note_list(filtered_notes)
+
+
+# ============================================================
+# 11. FOOTER
+# ============================================================
+
+st.divider()
+
+st.caption(
+    "Poorcone Lab · Personal AI Research Lab · "
+    "Powered by Python, SQLite, and Machine Learning."
+)

@@ -32,6 +32,21 @@ def add_note(title, category, content):
         )
 
 
+def update_note(note_id, title, category, content):
+    """Memperbarui catatan berdasarkan ID."""
+    with closing(get_connection()) as connection, connection:
+        cursor = connection.execute(
+            """
+            UPDATE notes
+            SET title = ?, category = ?, content = ?
+            WHERE id = ?
+            """,
+            (title, category, content, note_id),
+        )
+
+        return cursor.rowcount > 0
+
+
 def get_all_notes():
     with closing(get_connection()) as connection:
         cursor = connection.execute("""
