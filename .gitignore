@@ -10,10 +10,13 @@ wheels/
 .venv
 
 # Local database
-pair_lab.db
+poorcone_lab.db
 *.db
 *.sqlite
 *.sqlite3
 
 .agents/
 .claude/
+
+# User-uploaded documents
+/data/documents/

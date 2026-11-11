@@ -5,8 +5,11 @@ from database import (
     update_note,
     delete_note,
     get_all_notes,
+    get_all_documents,
     initialize_database,
 )
+
+from ingestion import ingest_document
 
 from search import rank_notes, rank_notes_char
 from semantic_search import rank_notes_semantic
@@ -259,8 +262,10 @@ def render_search_results(results, method):
 # ============================================================
 
 all_notes = get_all_notes()
+all_documents = get_all_documents()
 
 total_notes = len(all_notes)
+total_documents = len(all_documents)
 
 total_categories = len({note[2] for note in all_notes})
 
@@ -276,7 +281,6 @@ flash_message = st.session_state.pop(
 
 if flash_message:
     st.success(flash_message)
-
 
 header_left, header_right = st.columns([4, 1])
 
@@ -295,7 +299,7 @@ st.divider()
 # 6. DASHBOARD METRICS
 # ============================================================
 
-metric1, metric2, metric3 = st.columns(3)
+metric1, metric2, metric3, metric4 = st.columns(4)
 
 with metric1:
     st.metric(
@@ -313,6 +317,13 @@ with metric2:
 
 with metric3:
     st.metric(
+        "Documents",
+        total_documents,
+        help="Jumlah dokumen yang telah diimpor.",
+    )
+
+with metric4:
+    st.metric(
         "Search Modes",
         4,
         help="Adaptive Hybrid, Semantic, Character, dan Word TF-IDF.",
@@ -326,11 +337,12 @@ st.divider()
 # 7. MAIN NAVIGATION
 # ============================================================
 
-explore_tab, add_tab, notes_tab = st.tabs(
+explore_tab, add_tab, notes_tab, documents_tab = st.tabs(
     [
         "🔎 Explore",
         "✍️ Add Notes",
         "📚 My Notes",
+        "📄 Documents",
     ],
     key="main_tabs",
     on_change="rerun",
@@ -628,7 +640,206 @@ with notes_tab:
 
 
 # ============================================================
-# 11. FOOTER
+# 11. DOCUMENTS TAB
+# ============================================================
+
+with documents_tab:
+    st.subheader("Document Library")
+
+    st.caption("Impor dan kelola dokumen sebagai bagian dari personal knowledge base.")
+
+    # --------------------------------------------------------
+    # DOCUMENT UPLOAD
+    # --------------------------------------------------------
+
+    st.markdown("#### Import Documents")
+
+    st.caption(
+        "Format yang didukung: TXT dan Markdown. Ukuran maksimum: 10 MB per file."
+    )
+
+    uploaded_files = st.file_uploader(
+        "Pilih dokumen",
+        type=["txt", "md"],
+        accept_multiple_files=True,
+        help="Kamu dapat mengunggah beberapa dokumen sekaligus.",
+        key="document_uploader",
+    )
+
+    if st.button(
+        "📥 Import Documents",
+        type="primary",
+        use_container_width=True,
+        disabled=not uploaded_files,
+        key="import_documents_button",
+    ):
+        import_messages = []
+
+        for uploaded_file in uploaded_files:
+            try:
+                result = ingest_document(
+                    filename=uploaded_file.name,
+                    content=uploaded_file.getvalue(),
+                )
+
+                if result.is_duplicate:
+                    import_messages.append(
+                        (
+                            "warning",
+                            f"{uploaded_file.name}: konten sudah "
+                            f"tersimpan sebagai dokumen ID "
+                            f"{result.document_id}.",
+                        )
+                    )
+
+                else:
+                    import_messages.append(
+                        (
+                            "success",
+                            f"{uploaded_file.name} berhasil diimpor.",
+                        )
+                    )
+
+            except Exception as error:
+                import_messages.append(
+                    (
+                        "error",
+                        f"Gagal mengimpor {uploaded_file.name}: {error}",
+                    )
+                )
+
+        st.session_state["document_import_messages"] = import_messages
+
+        st.rerun()
+
+    # --------------------------------------------------------
+    # IMPORT NOTIFICATIONS
+    # --------------------------------------------------------
+
+    document_import_messages = st.session_state.pop(
+        "document_import_messages",
+        [],
+    )
+
+    if document_import_messages:
+        success_messages = [
+            message for level, message in document_import_messages if level == "success"
+        ]
+
+        duplicate_messages = [
+            message for level, message in document_import_messages if level == "warning"
+        ]
+
+        error_messages = [
+            message for level, message in document_import_messages if level == "error"
+        ]
+
+        with st.container(border=True):
+            st.markdown("#### Import Results")
+
+            result_col1, result_col2, result_col3 = st.columns(3)
+
+            with result_col1:
+                st.metric("Imported", len(success_messages))
+
+            with result_col2:
+                st.metric("Duplicates", len(duplicate_messages))
+
+            with result_col3:
+                st.metric("Failed", len(error_messages))
+
+            # Detail setiap file.
+            with st.expander(
+                "View import details",
+                expanded=bool(error_messages),
+            ):
+                for level, message in document_import_messages:
+                    if level == "success":
+                        st.success(message)
+
+                    elif level == "warning":
+                        st.warning(message)
+
+                    elif level == "error":
+                        st.error(message)
+
+    # --------------------------------------------------------
+    # DOCUMENT LIBRARY
+    # --------------------------------------------------------
+
+    st.divider()
+
+    st.markdown("#### Your Documents")
+
+    if not all_documents:
+        st.info("Belum ada dokumen. Impor file TXT atau Markdown untuk memulai.")
+
+    else:
+        st.caption(f"Menampilkan {total_documents} dokumen.")
+
+        for document in all_documents:
+            (
+                document_id,
+                title,
+                original_filename,
+                file_type,
+                storage_path,
+                file_size_bytes,
+                content_hash,
+                extracted_text,
+                processing_status,
+                processing_error,
+                created_at,
+                updated_at,
+            ) = document
+
+            with st.expander(
+                f"{title} · {original_filename}",
+                expanded=False,
+            ):
+                # Document metadata.
+                col1, col2 = st.columns(2)
+
+                with col1:
+                    st.caption(f"Document ID: {document_id}")
+                    st.caption(f"Format: {file_type.upper()}")
+
+                with col2:
+                    st.caption(f"Size: {file_size_bytes / 1024:.2f} KB")
+                    st.caption(f"Status: {processing_status}")
+
+                st.caption(f"Imported: {created_at}")
+
+                st.caption(f"Storage: `{storage_path}`")
+
+                # Extraction result.
+                if processing_status == "completed":
+                    preview_limit = 5000
+
+                    preview_text = extracted_text[:preview_limit]
+
+                    st.markdown("##### Extracted Text")
+
+                    st.text_area(
+                        "Document preview",
+                        value=preview_text,
+                        height=220,
+                        disabled=True,
+                        key=f"document_preview_{document_id}",
+                    )
+
+                    if len(extracted_text) > preview_limit:
+                        st.caption(
+                            "Preview dibatasi hingga 5.000 karakter. "
+                            "Konten lengkap tetap tersimpan di database."
+                        )
+
+                elif processing_status == "failed":
+                    st.error(processing_error or "Document processing failed.")
+
+
+# ============================================================
+# 12. FOOTER
 # ============================================================
 
 st.divider()

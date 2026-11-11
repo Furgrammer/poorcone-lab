@@ -187,11 +187,11 @@ poorcone-lab/
 
 ## Local Data and Privacy
 
-The application stores notes in a local SQLite database named `pair_lab.db`, located in the project directory. The database is initialized automatically when the application starts if it does not already exist.
+The application stores notes in a local SQLite database named `poorcone_lab.db`, located in the project directory. The database is initialized automatically when the application starts if it does not already exist.
 
 - The database contains user-created notes and should be treated as private application data.
 - Database files are excluded from Git through `.gitignore`; do not force-add them to a public repository.
-- Back up `pair_lab.db` before making database schema changes or performing maintenance.
+- Back up `poorcone_lab.db` before making database schema changes or performing maintenance.
 - `uv sync --locked` installs dependencies; it is not a database migration or reset command.
 
 The database filename is retained for compatibility with the existing implementation, even though the project is named Poorcone Lab.
