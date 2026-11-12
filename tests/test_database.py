@@ -1,4 +1,6 @@
 import pytest
+import sqlite3
+from contextlib import closing
 
 import database
 
@@ -7,9 +9,9 @@ import database
 def db(tmp_path, monkeypatch):
     """
     Membuat database sementara untuk setiap test.
-    Database utama pair_lab.db tidak akan disentuh.
+    Database utama poorcone_lab.db tidak akan disentuh.
     """
-    test_db_path = tmp_path / "test_pair_lab.db"
+    test_db_path = tmp_path / "test_poorcone_lab.db"
 
     monkeypatch.setattr(
         database,
@@ -129,3 +131,113 @@ def test_delete_note(db):
     db.delete_note(note_id)
 
     assert db.get_all_notes() == []
+
+
+def test_migration_creates_documents_table(db):
+    """Migration membuat tabel documents dan mengatur versi skema."""
+
+    with closing(db.get_connection()) as connection:
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+
+        documents_table = connection.execute("""
+            SELECT name
+            FROM sqlite_master
+            WHERE type = 'table'
+            AND name = 'documents'
+        """).fetchone()
+
+    assert version == 1
+    assert documents_table is not None
+
+
+def test_migration_preserves_existing_notes(tmp_path, monkeypatch):
+    """Migration tidak menghapus catatan dari database lama."""
+
+    test_db_path = tmp_path / "legacy.db"
+
+    monkeypatch.setattr(
+        database,
+        "DB_PATH",
+        test_db_path,
+    )
+
+    # Simulasikan database lama sebelum migration.
+    with sqlite3.connect(test_db_path) as connection:
+        connection.execute("""
+            CREATE TABLE notes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                category TEXT NOT NULL,
+                content TEXT NOT NULL
+            )
+        """)
+
+        connection.executemany(
+            """
+            INSERT INTO notes (title, category, content)
+            VALUES (?, ?, ?)
+            """,
+            [
+                ("Python Basics", "Python", "Konten Python."),
+                ("Machine Learning", "AI", "Konten ML."),
+            ],
+        )
+
+        connection.execute("PRAGMA user_version = 0")
+
+    # Jalankan migration.
+    database.initialize_database()
+
+    notes = database.get_all_notes()
+
+    assert len(notes) == 2
+
+    assert notes[0][1:] == (
+        "Machine Learning",
+        "AI",
+        "Konten ML.",
+    )
+
+    assert notes[1][1:] == (
+        "Python Basics",
+        "Python",
+        "Konten Python.",
+    )
+
+
+def test_initialize_database_is_idempotent(db):
+    """Migration tidak mengulang perubahan yang sudah diterapkan."""
+
+    db.add_note(
+        "Python Basics",
+        "Python",
+        "Konten Python.",
+    )
+
+    db.initialize_database()
+    db.initialize_database()
+
+    notes = db.get_all_notes()
+
+    assert len(notes) == 1
+
+
+def test_initialize_database_rejects_newer_schema(
+    tmp_path,
+    monkeypatch,
+):
+    """Database dengan versi lebih baru harus ditolak."""
+
+    test_db_path = tmp_path / "future.db"
+
+    monkeypatch.setattr(
+        database,
+        "DB_PATH",
+        test_db_path,
+    )
+
+    with sqlite3.connect(test_db_path) as connection:
+        connection.execute("PRAGMA user_version = 99")
+
+    with pytest.raises(RuntimeError, match="newer than supported"):
+        database.initialize_database()

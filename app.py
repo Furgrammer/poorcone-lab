@@ -654,13 +654,11 @@ with documents_tab:
 
     st.markdown("#### Import Documents")
 
-    st.caption(
-        "Format yang didukung: TXT dan Markdown. Ukuran maksimum: 10 MB per file."
-    )
+    st.caption("Format yang didukung: TXT, Markdown, PDF, dan DOCX. ")
 
     uploaded_files = st.file_uploader(
         "Pilih dokumen",
-        type=["txt", "md"],
+        type=["txt", "md", "pdf", "docx"],
         accept_multiple_files=True,
         help="Kamu dapat mengunggah beberapa dokumen sekaligus.",
         key="document_uploader",
