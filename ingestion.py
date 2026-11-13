@@ -1,7 +1,9 @@
 import hashlib
+import os
+import stat
 import uuid
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 from io import BytesIO
 
@@ -48,6 +50,26 @@ class IngestionResult:
     content_hash: str
     file_size_bytes: int
     is_duplicate: bool
+
+
+@dataclass(frozen=True)
+class DocumentDeletionResult:
+    document_id: int
+    file_missing: bool = False
+    cleanup_pending: bool = False
+    staging_path: Path | None = None
+
+
+class DocumentNotFoundError(LookupError):
+    """Raised when a requested document does not exist in SQLite."""
+
+
+class DocumentDeletionRecoveryError(RuntimeError):
+    """Raised when a staged file cannot be restored after database failure."""
+
+    def __init__(self, message, recovery_path):
+        super().__init__(f"{message} File recovery location: {recovery_path}")
+        self.recovery_path = Path(recovery_path)
 
 
 # ============================================================
@@ -340,4 +362,188 @@ def ingest_document(filename, content):
         content_hash=content_hash,
         file_size_bytes=file_size_bytes,
         is_duplicate=False,
+    )
+
+
+def _validated_document_path(storage_path):
+    if not isinstance(storage_path, str) or not storage_path.strip():
+        raise ValueError("Storage path dokumen tidak valid.")
+
+    if "\x00" in storage_path:
+        raise ValueError("Storage path dokumen tidak valid.")
+
+    relative_path = Path(storage_path)
+    windows_path = PureWindowsPath(storage_path)
+
+    if (
+        relative_path.is_absolute()
+        or windows_path.is_absolute()
+        or windows_path.drive
+        or ".." in relative_path.parts
+        or ".." in windows_path.parts
+    ):
+        raise ValueError("Storage path dokumen harus berupa path relatif yang aman.")
+
+    project_root = Path(PROJECT_ROOT).resolve()
+    storage_root = Path(os.path.abspath(DOCUMENT_STORAGE_DIR))
+
+    try:
+        storage_root_relative = storage_root.relative_to(project_root)
+    except ValueError as error:
+        raise ValueError("Direktori storage dokumen berada di luar project.") from error
+
+    current_path = project_root
+    for part in storage_root_relative.parts:
+        current_path = current_path / part
+        if current_path.is_symlink():
+            raise ValueError("Symlink tidak diizinkan dalam direktori storage.")
+
+    candidate_path = Path(os.path.abspath(project_root / relative_path))
+
+    try:
+        candidate_relative = candidate_path.relative_to(storage_root)
+    except ValueError as error:
+        raise ValueError("Storage path berada di luar direktori dokumen.") from error
+
+    if not candidate_relative.parts:
+        raise ValueError("Storage path harus menunjuk ke sebuah file.")
+
+    current_path = storage_root
+    for part in candidate_relative.parts:
+        current_path = current_path / part
+        if current_path.is_symlink():
+            raise ValueError("Symlink tidak diizinkan pada storage path dokumen.")
+
+    resolved_storage_root = storage_root.resolve()
+    resolved_path = candidate_path.resolve()
+
+    try:
+        resolved_relative = resolved_path.relative_to(resolved_storage_root)
+    except ValueError as error:
+        raise ValueError("Resolved storage path berada di luar direktori dokumen.") from error
+
+    if not resolved_relative.parts:
+        raise ValueError("Storage path harus menunjuk ke sebuah file.")
+
+    return resolved_storage_root, resolved_path
+
+
+def _validated_staging_directory(storage_root):
+    staging_directory = storage_root / ".deletion-staging"
+
+    if staging_directory.is_symlink():
+        raise ValueError("Direktori staging tidak boleh berupa symlink.")
+
+    staging_directory.mkdir(mode=0o700, exist_ok=True)
+
+    if staging_directory.is_symlink() or not staging_directory.is_dir():
+        raise ValueError("Direktori staging dokumen tidak aman.")
+
+    if staging_directory.resolve() != storage_root / ".deletion-staging":
+        raise ValueError("Direktori staging berada di luar storage dokumen.")
+
+    return staging_directory
+
+
+def _restore_staged_file(staged_path, original_path, storage_root):
+    staging_directory = _validated_staging_directory(storage_root)
+
+    if staged_path.parent != staging_directory or staged_path.is_symlink():
+        raise OSError("File staging berubah atau tidak aman.")
+
+    if not staged_path.is_file():
+        raise FileNotFoundError(f"File staging tidak ditemukan: {staged_path}")
+
+    if original_path.exists() or original_path.is_symlink():
+        raise FileExistsError(f"Lokasi asal sudah digunakan: {original_path}")
+
+    os.replace(staged_path, original_path)
+
+
+def delete_document(document_id):
+    """
+    Menghapus metadata dokumen dan file sumber secara terkoordinasi.
+
+    Mengembalikan None jika ID tidak ada. Result menandai file yang
+    sebelumnya sudah hilang atau cleanup yang masih tertunda.
+    """
+
+    document = database.get_document_by_id(document_id)
+    if document is None:
+        raise DocumentNotFoundError(f"Dokumen dengan ID {document_id} tidak ditemukan.")
+
+    storage_root, original_path = _validated_document_path(document[4])
+
+    try:
+        source_stat = original_path.lstat()
+    except FileNotFoundError:
+        file_missing = True
+        staged_path = None
+    else:
+        file_missing = False
+
+        if stat.S_ISLNK(source_stat.st_mode):
+            raise ValueError("Symlink tidak diizinkan sebagai file dokumen.")
+
+        if not stat.S_ISREG(source_stat.st_mode):
+            raise ValueError("Storage path dokumen bukan file biasa.")
+
+        staging_directory = _validated_staging_directory(storage_root)
+        staged_path = staging_directory / (
+            f"document-{document_id}-{uuid.uuid4().hex}.pending"
+        )
+
+        if staged_path.exists() or staged_path.is_symlink():
+            raise FileExistsError(f"Lokasi staging sudah digunakan: {staged_path}")
+
+        os.replace(original_path, staged_path)
+
+    try:
+        deleted = database.delete_document(document_id)
+    except Exception as error:
+        if staged_path is not None:
+            try:
+                _restore_staged_file(staged_path, original_path, storage_root)
+            except Exception as restore_error:
+                raise DocumentDeletionRecoveryError(
+                    f"Penghapusan metadata gagal ({error}) dan file tidak dapat "
+                    "dikembalikan.",
+                    staged_path,
+                ) from restore_error
+        raise
+
+    if not deleted:
+        if staged_path is not None:
+            try:
+                _restore_staged_file(staged_path, original_path, storage_root)
+            except Exception as restore_error:
+                raise DocumentDeletionRecoveryError(
+                    "Record dokumen tidak terhapus dan file tidak dapat "
+                    "dikembalikan.",
+                    staged_path,
+                ) from restore_error
+        return None
+
+    if staged_path is not None:
+        try:
+            staging_directory = _validated_staging_directory(storage_root)
+            if staged_path.parent != staging_directory or staged_path.is_symlink():
+                raise OSError("File staging berubah atau tidak aman.")
+            staged_path.unlink()
+        except OSError:
+            return DocumentDeletionResult(
+                document_id=document_id,
+                cleanup_pending=True,
+                staging_path=staged_path,
+            )
+        except ValueError:
+            return DocumentDeletionResult(
+                document_id=document_id,
+                cleanup_pending=True,
+                staging_path=staged_path,
+            )
+
+    return DocumentDeletionResult(
+        document_id=document_id,
+        file_missing=file_missing,
     )

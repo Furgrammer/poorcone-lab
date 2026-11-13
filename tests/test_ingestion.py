@@ -41,6 +41,20 @@ def isolated_environment(tmp_path, monkeypatch):
     return tmp_path
 
 
+def add_document_record(storage_path):
+    """Membuat metadata uji tanpa membaca file dokumen apa pun."""
+
+    return ingestion.database.add_document(
+        title="Test document",
+        original_filename="test.txt",
+        file_type="txt",
+        storage_path=str(storage_path),
+        file_size_bytes=12,
+        content_hash="test-document-hash",
+        extracted_text="Synthetic test content.",
+    )
+
+
 def test_ingest_txt_success(isolated_environment):
     """File TXT berhasil diekstrak dan disimpan."""
 
@@ -366,3 +380,232 @@ def test_invalid_docx_is_rejected(isolated_environment):
             "invalid.docx",
             b"Not a valid DOCX file.",
         )
+
+
+def test_delete_document_removes_file_and_metadata_and_preserves_related_data(
+    isolated_environment,
+):
+    result = ingestion.ingest_document("sample.txt", b"Sample source content.")
+    document = ingestion.database.get_document_by_id(result.document_id)
+    stored_file = isolated_environment / document[4]
+
+    ingestion.database.add_note("Unrelated note", "Python", "Note content.")
+    note_id = ingestion.database.get_all_notes()[0][0]
+    tag_id = ingestion.database.create_tag("Shared")
+    ingestion.database.add_note_tag(note_id, tag_id)
+    ingestion.database.add_document_tag(result.document_id, tag_id)
+
+    deletion = ingestion.delete_document(result.document_id)
+
+    assert deletion.document_id == result.document_id
+    assert deletion.file_missing is False
+    assert deletion.cleanup_pending is False
+    assert deletion.staging_path is None
+    assert not stored_file.exists()
+    assert ingestion.database.get_document_by_id(result.document_id) is None
+    assert ingestion.database.get_all_notes()[0][1] == "Unrelated note"
+    assert [tag[0] for tag in ingestion.database.get_note_tags(note_id)] == [tag_id]
+    assert ingestion.database.get_tag(tag_id) is not None
+
+
+def test_delete_document_reports_missing_physical_file(isolated_environment):
+    result = ingestion.ingest_document("missing.txt", b"Source content.")
+    document = ingestion.database.get_document_by_id(result.document_id)
+    stored_file = isolated_environment / document[4]
+    stored_file.unlink()
+
+    deletion = ingestion.delete_document(result.document_id)
+
+    assert deletion.file_missing is True
+    assert deletion.cleanup_pending is False
+    assert ingestion.database.get_document_by_id(result.document_id) is None
+
+
+def test_delete_document_raises_for_missing_database_record(isolated_environment):
+    with pytest.raises(ingestion.DocumentNotFoundError, match="ID 99999"):
+        ingestion.delete_document(99999)
+
+
+def test_delete_document_restores_file_when_database_delete_fails(
+    isolated_environment,
+    monkeypatch,
+):
+    result = ingestion.ingest_document("restore.txt", b"Restore me.")
+    document = ingestion.database.get_document_by_id(result.document_id)
+    stored_file = isolated_environment / document[4]
+
+    def fail_delete(document_id):
+        raise sqlite3.OperationalError("Simulated database error")
+
+    monkeypatch.setattr(ingestion.database, "delete_document", fail_delete)
+
+    with pytest.raises(sqlite3.OperationalError, match="Simulated database error"):
+        ingestion.delete_document(result.document_id)
+
+    assert stored_file.read_bytes() == b"Restore me."
+    assert ingestion.database.get_document_by_id(result.document_id) is not None
+
+
+def test_document_title_update_does_not_change_physical_file(
+    isolated_environment,
+):
+    result = ingestion.ingest_document("title.txt", b"Keep original bytes.")
+    before = ingestion.database.get_document_by_id(result.document_id)
+    stored_file = isolated_environment / before[4]
+
+    assert ingestion.database.update_document_title(
+        result.document_id,
+        "  User-facing title  ",
+    )
+
+    after = ingestion.database.get_document_by_id(result.document_id)
+    assert after[1] == "User-facing title"
+    assert after[2:11] == before[2:11]
+    assert stored_file.read_bytes() == b"Keep original bytes."
+
+
+def test_delete_document_reports_recovery_location_if_restore_fails(
+    isolated_environment,
+    monkeypatch,
+):
+    result = ingestion.ingest_document("recovery.txt", b"Recover me.")
+    document = ingestion.database.get_document_by_id(result.document_id)
+    stored_file = isolated_environment / document[4]
+    original_replace = ingestion.os.replace
+
+    def fail_restore(source, destination):
+        if Path(source).parent.name == ".deletion-staging":
+            raise OSError("Simulated restore failure")
+        original_replace(source, destination)
+
+    def fail_delete(document_id):
+        raise sqlite3.OperationalError("Simulated database error")
+
+    monkeypatch.setattr(ingestion.database, "delete_document", fail_delete)
+    monkeypatch.setattr(ingestion.os, "replace", fail_restore)
+
+    with pytest.raises(ingestion.DocumentDeletionRecoveryError) as error:
+        ingestion.delete_document(result.document_id)
+
+    recovery_path = error.value.recovery_path
+    assert str(recovery_path) in str(error.value)
+    assert recovery_path.exists()
+    assert not stored_file.exists()
+    assert ingestion.database.get_document_by_id(result.document_id) is not None
+
+
+def test_delete_document_reports_cleanup_pending_location(
+    isolated_environment,
+    monkeypatch,
+):
+    result = ingestion.ingest_document("cleanup.txt", b"Cleanup later.")
+    original_unlink = Path.unlink
+
+    def fail_staged_unlink(path, *args, **kwargs):
+        if path.parent.name == ".deletion-staging":
+            raise PermissionError("Simulated cleanup failure")
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_staged_unlink)
+
+    deletion = ingestion.delete_document(result.document_id)
+
+    assert deletion.cleanup_pending is True
+    assert deletion.staging_path is not None
+    assert deletion.staging_path.exists()
+    assert ingestion.database.get_document_by_id(result.document_id) is None
+
+
+def test_delete_document_restores_file_when_database_delete_returns_false(
+    isolated_environment,
+    monkeypatch,
+):
+    result = ingestion.ingest_document("not-deleted.txt", b"Keep me.")
+    document = ingestion.database.get_document_by_id(result.document_id)
+    stored_file = isolated_environment / document[4]
+    monkeypatch.setattr(ingestion.database, "delete_document", lambda _: False)
+
+    assert ingestion.delete_document(result.document_id) is None
+    assert stored_file.read_bytes() == b"Keep me."
+    assert ingestion.database.get_document_by_id(result.document_id) is not None
+
+
+@pytest.mark.parametrize(
+    "path_kind",
+    ["traversal", "absolute"],
+)
+def test_delete_document_rejects_traversal_and_absolute_paths(
+    isolated_environment,
+    path_kind,
+):
+    outside_file = isolated_environment / "outside.txt"
+    outside_file.write_text("Do not delete.", encoding="utf-8")
+    storage_path = (
+        "data/documents/../../outside.txt"
+        if path_kind == "traversal"
+        else str(outside_file)
+    )
+    document_id = add_document_record(storage_path)
+
+    with pytest.raises(ValueError, match="path|Storage"):
+        ingestion.delete_document(document_id)
+
+    assert outside_file.read_text(encoding="utf-8") == "Do not delete."
+    assert ingestion.database.get_document_by_id(document_id) is not None
+
+
+def test_delete_document_rejects_symlinked_document_path(
+    isolated_environment,
+):
+    outside_file = isolated_environment / "outside.txt"
+    outside_file.write_text("Do not follow symlinks.", encoding="utf-8")
+    ingestion.DOCUMENT_STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+    link_path = ingestion.DOCUMENT_STORAGE_DIR / "linked.txt"
+    link_path.symlink_to(outside_file)
+    document_id = add_document_record("data/documents/linked.txt")
+
+    with pytest.raises(ValueError, match="Symlink"):
+        ingestion.delete_document(document_id)
+
+    assert outside_file.read_text(encoding="utf-8") == "Do not follow symlinks."
+    assert link_path.is_symlink()
+    assert ingestion.database.get_document_by_id(document_id) is not None
+
+
+def test_delete_document_rejects_symlinked_staging_directory(
+    isolated_environment,
+):
+    result = ingestion.ingest_document("staging.txt", b"Keep this file.")
+    document = ingestion.database.get_document_by_id(result.document_id)
+    stored_file = isolated_environment / document[4]
+    outside_directory = isolated_environment / "outside"
+    outside_directory.mkdir()
+    staging_directory = ingestion.DOCUMENT_STORAGE_DIR / ".deletion-staging"
+    staging_directory.symlink_to(outside_directory, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="staging"):
+        ingestion.delete_document(result.document_id)
+
+    assert stored_file.read_bytes() == b"Keep this file."
+    assert ingestion.database.get_document_by_id(result.document_id) is not None
+    assert list(outside_directory.iterdir()) == []
+
+
+def test_delete_document_keeps_record_when_atomic_move_fails(
+    isolated_environment,
+    monkeypatch,
+):
+    result = ingestion.ingest_document("move-failure.txt", b"Keep source.")
+    document = ingestion.database.get_document_by_id(result.document_id)
+    stored_file = isolated_environment / document[4]
+
+    def fail_move(*args, **kwargs):
+        raise OSError("Simulated move failure")
+
+    monkeypatch.setattr(ingestion.os, "replace", fail_move)
+
+    with pytest.raises(OSError, match="Simulated move failure"):
+        ingestion.delete_document(result.document_id)
+
+    assert stored_file.read_bytes() == b"Keep source."
+    assert ingestion.database.get_document_by_id(result.document_id) is not None
