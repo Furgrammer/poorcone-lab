@@ -6,10 +6,27 @@ from database import (
     delete_note,
     get_all_notes,
     get_all_documents,
+    get_all_tags,
+    normalize_tag_name,
+    get_note_tags,
+    get_document_tags,
+    create_tag,
+    rename_tag,
+    delete_tag,
+    add_note_tag,
+    remove_note_tag,
+    add_document_tag,
+    remove_document_tag,
+    update_document_title,
     initialize_database,
 )
 
-from ingestion import ingest_document
+from ingestion import (
+    DocumentDeletionRecoveryError,
+    DocumentNotFoundError,
+    delete_document as delete_document_service,
+    ingest_document,
+)
 
 from search import rank_notes, rank_notes_char
 from semantic_search import rank_notes_semantic
@@ -85,7 +102,97 @@ NOTE_CATEGORIES = [
 ]
 
 
-def render_note_list(notes):
+def render_create_tag_form(form_key):
+    with st.form(f"create_tag_form_{form_key}", clear_on_submit=True):
+        tag_name = st.text_input(
+            "Nama tag",
+            key=f"create_tag_name_{form_key}",
+        )
+        submitted = st.form_submit_button(
+            "Buat tag",
+            key=f"create_tag_submit_{form_key}",
+        )
+
+    if submitted:
+        try:
+            existing_tags = get_all_tags()
+            normalized_name = normalize_tag_name(tag_name)
+            already_exists = any(tag[2] == normalized_name for tag in existing_tags)
+            create_tag(tag_name)
+
+            if already_exists:
+                st.session_state["ui_notice"] = (
+                    "info",
+                    f"Tag '{tag_name.strip()}' sudah tersedia.",
+                )
+            else:
+                st.session_state["ui_notice"] = (
+                    "success",
+                    f"Tag '{tag_name.strip()}' berhasil dibuat.",
+                )
+            st.rerun()
+        except ValueError as error:
+            st.error(str(error))
+        except Exception:
+            st.error("Tag gagal dibuat karena terjadi kesalahan database.")
+
+
+def render_tag_assignments(entity_type, entity_id, associated_tags):
+    if associated_tags:
+        st.caption("Tags: " + ", ".join(tag[1] for tag in associated_tags))
+    else:
+        st.caption("Belum ada tag.")
+
+    if entity_type == "note":
+        add_relationship = add_note_tag
+        remove_relationship = remove_note_tag
+        entity_label = "catatan"
+    else:
+        add_relationship = add_document_tag
+        remove_relationship = remove_document_tag
+        entity_label = "dokumen"
+
+    all_tags = get_all_tags()
+    attached_tag_ids = {tag[0] for tag in associated_tags}
+    available_tags = [tag for tag in all_tags if tag[0] not in attached_tag_ids]
+
+    if available_tags:
+        with st.form(f"add_{entity_type}_tag_{entity_id}"):
+            selected_tag_id = st.selectbox(
+                f"Tambahkan tag ke {entity_label}",
+                [tag[0] for tag in available_tags],
+                format_func=lambda tag_id: next(
+                    tag[1] for tag in available_tags if tag[0] == tag_id
+                ),
+                key=f"add_{entity_type}_tag_select_{entity_id}",
+            )
+            submitted = st.form_submit_button(
+                "Tambahkan tag",
+                key=f"add_{entity_type}_tag_submit_{entity_id}",
+            )
+
+        if submitted:
+            try:
+                add_relationship(entity_id, selected_tag_id)
+                st.rerun()
+            except Exception as error:
+                st.error(str(error))
+    else:
+        st.caption("Tidak ada tag lain untuk ditambahkan.")
+
+    for tag_id, tag_name, *_ in associated_tags:
+        if st.button(
+            f"Lepas tag: {tag_name}",
+            key=f"remove_{entity_type}_tag_{entity_id}_{tag_id}",
+        ):
+            try:
+                remove_relationship(entity_id, tag_id)
+                st.rerun()
+            except Exception as error:
+                st.error(str(error))
+
+
+def render_note_list(notes, note_tags_by_id):
     """Menampilkan catatan dengan opsi edit dan hapus."""
 
     for index, note in enumerate(notes, start=1):
@@ -115,18 +222,21 @@ def render_note_list(notes):
                     edited_title = st.text_input(
                         "Judul catatan",
                         value=title,
+                        key=f"edit_note_title_{note_id}",
                     )
 
                     edited_category = st.selectbox(
                         "Kategori",
                         edit_categories,
                         index=edit_categories.index(category),
+                        key=f"edit_note_category_{note_id}",
                     )
 
                     edited_content = st.text_area(
                         "Isi catatan",
                         value=content,
                         height=220,
+                        key=f"edit_note_content_{note_id}",
                     )
 
                     save_col, cancel_col = st.columns(2)
@@ -135,13 +245,13 @@ def render_note_list(notes):
                         save_submitted = st.form_submit_button(
                             "💾 Simpan perubahan",
                             type="primary",
-                            use_container_width=True,
+                            key=f"save_note_{note_id}",
                         )
 
                     with cancel_col:
                         cancel_submitted = st.form_submit_button(
                             "Batal",
-                            use_container_width=True,
+                            key=f"cancel_edit_note_{note_id}",
                         )
 
                 # Proses penyimpanan
@@ -227,6 +337,12 @@ def render_note_list(notes):
 
                         st.rerun()
 
+            render_tag_assignments(
+                "note",
+                note_id,
+                note_tags_by_id.get(note_id, []),
+            )
+
 
 def render_search_results(results, method):
     """Menampilkan hasil pencarian."""
@@ -263,6 +379,8 @@ def render_search_results(results, method):
 
 all_notes = get_all_notes()
 all_documents = get_all_documents()
+all_tags = get_all_tags()
+note_tags_by_id = {note[0]: get_note_tags(note[0]) for note in all_notes}
 
 total_notes = len(all_notes)
 total_documents = len(all_documents)
@@ -281,6 +399,11 @@ flash_message = st.session_state.pop(
 
 if flash_message:
     st.success(flash_message)
+
+ui_notice = st.session_state.pop("ui_notice", None)
+if ui_notice:
+    notice_level, notice_message = ui_notice
+    getattr(st, notice_level)(notice_message)
 
 header_left, header_right = st.columns([4, 1])
 
@@ -337,12 +460,13 @@ st.divider()
 # 7. MAIN NAVIGATION
 # ============================================================
 
-explore_tab, add_tab, notes_tab, documents_tab = st.tabs(
+explore_tab, add_tab, notes_tab, documents_tab, tags_tab = st.tabs(
     [
         "🔎 Explore",
         "✍️ Add Notes",
         "📚 My Notes",
         "📄 Documents",
+        "🏷️ Tags",
     ],
     key="main_tabs",
     on_change="rerun",
@@ -569,23 +693,26 @@ with add_tab:
         title = st.text_input(
             "Judul catatan",
             placeholder="Contoh: Introduction to Machine Learning",
+            key="new_note_title",
         )
 
         category = st.selectbox(
             "Kategori",
             NOTE_CATEGORIES,
+            key="new_note_category",
         )
 
         content = st.text_area(
             "Isi catatan",
             placeholder="Tuliskan pengetahuan atau informasi...",
             height=220,
+            key="new_note_content",
         )
 
         submitted = st.form_submit_button(
             "💾 Simpan catatan",
             type="primary",
-            use_container_width=True,
+            key="save_new_note",
         )
 
         if submitted:
@@ -615,28 +742,53 @@ with notes_tab:
 
     st.caption("Kelola dan lihat seluruh catatan yang tersimpan.")
 
+    st.markdown("#### Buat tag")
+    render_create_tag_form("notes")
+
     if not all_notes:
         st.info("Belum ada catatan. Mulai dengan menambahkan catatan pertama.")
 
     else:
         available_categories = sorted({note[2] for note in all_notes})
+        available_tag_ids = sorted(
+            {tag[0] for tags in note_tags_by_id.values() for tag in tags}
+            | {tag[0] for tag in all_tags}
+        )
 
         selected_category = st.selectbox(
             "Filter kategori",
             ["Semua kategori"] + available_categories,
+            key="notes_category_filter",
         )
 
-        if selected_category == "Semua kategori":
-            filtered_notes = all_notes
+        selected_tag_id = st.selectbox(
+            "Filter tag",
+            [None] + available_tag_ids,
+            format_func=lambda tag_id: (
+                "Semua tag"
+                if tag_id is None
+                else next(tag[1] for tag in all_tags if tag[0] == tag_id)
+            ),
+            key="notes_tag_filter",
+        )
 
-        else:
-            filtered_notes = [
-                note for note in all_notes if note[2] == selected_category
-            ]
+        filtered_notes = [
+            note
+            for note in all_notes
+            if (
+                selected_category == "Semua kategori"
+                or note[2] == selected_category
+            )
+            and (
+                selected_tag_id is None
+                or selected_tag_id
+                in {tag[0] for tag in note_tags_by_id.get(note[0], [])}
+            )
+        ]
 
         st.caption(f"Menampilkan {len(filtered_notes)} dari {total_notes} catatan.")
 
-        render_note_list(filtered_notes)
+        render_note_list(filtered_notes, note_tags_by_id)
 
 
 # ============================================================
@@ -768,6 +920,8 @@ with documents_tab:
     st.divider()
 
     st.markdown("#### Your Documents")
+    st.markdown("##### Buat tag")
+    render_create_tag_form("documents")
 
     if not all_documents:
         st.info("Belum ada dokumen. Impor file TXT atau Markdown untuk memulai.")
@@ -795,49 +949,207 @@ with documents_tab:
                 f"{title} · {original_filename}",
                 expanded=False,
             ):
-                # Document metadata.
+                st.caption(f"Original filename: {original_filename}")
                 col1, col2 = st.columns(2)
 
                 with col1:
                     st.caption(f"Document ID: {document_id}")
-                    st.caption(f"Format: {file_type.upper()}")
+                    st.caption(f"File type: {file_type.upper()}")
 
                 with col2:
-                    st.caption(f"Size: {file_size_bytes / 1024:.2f} KB")
+                    st.caption(f"File size: {file_size_bytes / 1024:.2f} KB")
                     st.caption(f"Status: {processing_status}")
 
                 st.caption(f"Imported: {created_at}")
 
-                st.caption(f"Storage: `{storage_path}`")
-
-                # Extraction result.
-                if processing_status == "completed":
-                    preview_limit = 5000
-
-                    preview_text = extracted_text[:preview_limit]
-
-                    st.markdown("##### Extracted Text")
-
-                    st.text_area(
-                        "Document preview",
-                        value=preview_text,
-                        height=220,
-                        disabled=True,
-                        key=f"document_preview_{document_id}",
+                st.markdown("##### Edit document title")
+                with st.form(f"edit_document_title_{document_id}"):
+                    edited_title = st.text_input(
+                        "Document title",
+                        value=title,
+                        key=f"document_title_input_{document_id}",
+                    )
+                    title_submitted = st.form_submit_button(
+                        "Save title",
+                        key=f"save_document_title_{document_id}",
                     )
 
-                    if len(extracted_text) > preview_limit:
-                        st.caption(
-                            "Preview dibatasi hingga 5.000 karakter. "
-                            "Konten lengkap tetap tersimpan di database."
+                if title_submitted:
+                    try:
+                        if update_document_title(document_id, edited_title):
+                            st.session_state["ui_notice"] = (
+                                "success",
+                                "Judul dokumen berhasil diperbarui.",
+                            )
+                            st.rerun()
+                        st.error("Dokumen tidak ditemukan.")
+                    except ValueError as error:
+                        st.error(str(error))
+                    except Exception:
+                        st.error("Judul dokumen gagal diperbarui.")
+
+                st.markdown("##### Document tags")
+                render_tag_assignments(
+                    "document",
+                    document_id,
+                    get_document_tags(document_id),
+                )
+
+                st.markdown("##### Document preview")
+                if processing_status == "completed":
+                    preview_limit = 5000
+                    show_preview = st.checkbox(
+                        "Show extracted text",
+                        key=f"show_document_preview_{document_id}",
+                    )
+
+                    if show_preview:
+                        preview_text = extracted_text[:preview_limit]
+                        st.text_area(
+                            "Extracted text",
+                            value=preview_text,
+                            height=220,
+                            disabled=True,
+                            key=f"document_preview_{document_id}",
                         )
 
+                        if len(extracted_text) > preview_limit:
+                            st.caption(
+                                "Preview dibatasi hingga 5.000 karakter. "
+                                "Konten lengkap tetap tersimpan di database."
+                            )
                 elif processing_status == "failed":
                     st.error(processing_error or "Document processing failed.")
 
+                st.markdown("##### Delete document")
+                st.warning(
+                    "Penghapusan akan menghapus metadata dan file dokumen. "
+                    "Tindakan ini tidak dapat dibatalkan."
+                )
+                confirmed = st.checkbox(
+                    "Saya yakin ingin menghapus dokumen ini",
+                    key=f"confirm_delete_document_{document_id}",
+                )
+                if st.button(
+                    "Delete document",
+                    key=f"delete_document_{document_id}",
+                    type="primary",
+                    disabled=not confirmed,
+                ):
+                    try:
+                        deletion = delete_document_service(document_id)
+                        if deletion is None:
+                            st.session_state["ui_notice"] = (
+                                "error",
+                                "Dokumen tidak ditemukan atau tidak terhapus.",
+                            )
+                        elif deletion.cleanup_pending:
+                            st.session_state["ui_notice"] = (
+                                "warning",
+                                "Metadata dokumen terhapus, tetapi pembersihan file "
+                                f"masih tertunda. Lokasi staging: {deletion.staging_path}",
+                            )
+                        elif deletion.file_missing:
+                            st.session_state["ui_notice"] = (
+                                "warning",
+                                "Metadata dokumen terhapus; file fisik sebelumnya "
+                                "sudah tidak ditemukan.",
+                            )
+                        else:
+                            st.session_state["ui_notice"] = (
+                                "success",
+                                "Dokumen dan file fisiknya berhasil dihapus.",
+                            )
+                        st.rerun()
+                    except DocumentNotFoundError:
+                        st.session_state["ui_notice"] = (
+                            "error",
+                            "Dokumen tidak ditemukan.",
+                        )
+                        st.rerun()
+                    except DocumentDeletionRecoveryError as error:
+                        st.session_state["ui_notice"] = (
+                            "error",
+                            "Penghapusan metadata gagal dan file tidak dapat "
+                            f"dipulihkan. Lokasi pemulihan: {error.recovery_path}",
+                        )
+                        st.rerun()
+                    except Exception:
+                        st.error("Dokumen gagal dihapus. Data belum dapat dipastikan.")
+
 
 # ============================================================
-# 12. FOOTER
+# 12. GLOBAL TAG MANAGEMENT
+# ============================================================
+
+with tags_tab:
+    st.subheader("Tag management")
+    st.caption("Tag yang sama dapat digunakan oleh Notes dan Documents.")
+    st.warning(
+        "Menghapus tag akan melepas relasinya dari Notes dan Documents, "
+        "tetapi tidak menghapus Notes atau Documents tersebut."
+    )
+
+    st.markdown("#### Buat tag")
+    render_create_tag_form("global")
+
+    st.divider()
+    st.markdown("#### Existing tags")
+
+    current_tags = get_all_tags()
+    if not current_tags:
+        st.info("Belum ada tag.")
+    else:
+        for tag_id, tag_name, *_ in current_tags:
+            with st.expander(tag_name, key=f"global_tag_{tag_id}"):
+                with st.form(f"rename_tag_form_{tag_id}"):
+                    new_tag_name = st.text_input(
+                        "Nama tag baru",
+                        value=tag_name,
+                        key=f"rename_tag_name_{tag_id}",
+                    )
+                    rename_submitted = st.form_submit_button(
+                        "Ganti nama tag",
+                        key=f"rename_tag_submit_{tag_id}",
+                    )
+
+                if rename_submitted:
+                    try:
+                        if rename_tag(tag_id, new_tag_name):
+                            st.session_state["ui_notice"] = (
+                                "success",
+                                f"Tag '{tag_name}' berhasil diganti namanya.",
+                            )
+                            st.rerun()
+                        st.error("Tag tidak ditemukan.")
+                    except ValueError as error:
+                        st.error(str(error))
+                    except Exception:
+                        st.error("Tag gagal diganti namanya.")
+
+                confirmed = st.checkbox(
+                    "Saya paham relasi tag ini akan dilepas",
+                    key=f"confirm_delete_tag_{tag_id}",
+                )
+                if st.button(
+                    "Hapus tag",
+                    key=f"delete_tag_{tag_id}",
+                    disabled=not confirmed,
+                ):
+                    try:
+                        if delete_tag(tag_id):
+                            st.session_state["ui_notice"] = (
+                                "success",
+                                f"Tag '{tag_name}' dan relasinya berhasil dihapus.",
+                            )
+                            st.rerun()
+                        st.error("Tag tidak ditemukan.")
+                    except Exception:
+                        st.error("Tag gagal dihapus.")
+
+
+# ============================================================
+# 13. FOOTER
 # ============================================================
 
 st.divider()
